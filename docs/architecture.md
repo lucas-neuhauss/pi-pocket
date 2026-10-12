@@ -15,7 +15,8 @@ Some state lives in this process alone, and a restart forgets it. For example:
 - which tool calls wait for approval;
 - the browser's pages;
 - when each run ended, which peek tiles use;
-- provider sign-ins in progress.
+- provider sign-ins in progress;
+- new-file line counts (`changes.ts`): up to 1,000 stat-keyed entries shared across sessions for 30 seconds, with at most four extra Git comparisons running at once. File metadata changes invalidate counts immediately; expiry also rechecks Git attributes. Failed comparisons are not cached.
 
 ## Who owns what
 
