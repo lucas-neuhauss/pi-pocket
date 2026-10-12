@@ -17,13 +17,13 @@ export type ChangedFile = {
     /** Relative to the repository's top folder. */
     path: string;
     kind: ChangeKind;
-    /** Lines added and removed; absent for binary files and new ones. */
+    /** Lines added and removed, including untracked text files; absent for binary or unreadable files. */
     added?: number;
     removed?: number;
     /** Pi wrote or edited it in this session. */
     byPi: boolean;
     /**
-     * Changes whenever the file does (its size and modification time), so a browser knows its diff is new even when
+     * Changes with the file's stat metadata, so a browser knows its diff is new even when
      * the counts stay the same; absent for a file that is gone.
      */
     version?: string;
@@ -62,6 +62,9 @@ const DIFF_FLAGS = [
     "--src-prefix=a/",
     "--dst-prefix=b/",
 ];
+
+// -U3 enables patch output even alongside --numstat: summaries must not generate full diffs.
+const COUNT_FLAGS = DIFF_FLAGS.filter((flag) => flag !== "-U3");
 
 const EDITORS = new Set(["write", "edit"]);
 /** The codemode tool's name (`extensions/codemode.ts`): its results list the calls a script made. */
@@ -213,7 +216,12 @@ export function parseNumstat(output: string): Map<string, { added?: number; remo
     const counts = new Map<string, { added?: number; removed?: number }>();
 
     for (let at = 0; at < fields.length; at++) {
-        const [added = "", removed = "", path = ""] = fields[at]!.split("\t");
+        const field = fields[at]!;
+        const first = field.indexOf("\t");
+        const second = field.indexOf("\t", first + 1);
+        const added = first < 0 ? "" : field.slice(0, first);
+        const removed = field.slice(first + 1, second);
+        const path = field.slice(second + 1);
 
         if (added === "") {
             continue;
@@ -232,15 +240,89 @@ export function parseNumstat(output: string): Map<string, { added?: number; remo
     return counts;
 }
 
-/** A file's size and modification time, one of which changes when it does; undefined when it is not there. */
+/** A file's stat fingerprint, including ctime for same-size rewrites; undefined when it is not there. */
 async function versionOf(file: string): Promise<string | undefined> {
     try {
         const info = await lstat(file);
 
-        return `${info.size}:${info.mtimeMs}`;
+        return `${info.size}:${info.mtimeMs}:${info.ctimeMs}:${info.ino}:${info.mode}`;
     } catch {
         return undefined;
     }
+}
+
+type LineCounts = { added?: number; removed?: number };
+
+/** Share unchanged new-file counts across sessions, but bound memory and periodically recheck git attributes. */
+const newCounts = new Map<string, { until: number; value: Promise<LineCounts> }>();
+const MAX_NEW_COUNTS = 1000;
+const NEW_COUNTS_TTL = 30_000;
+const COUNT_CONCURRENCY = 4;
+let counting = 0;
+const countWaiters: (() => void)[] = [];
+
+/** At most four extra git processes across all sessions, not four per request. */
+async function countNewFile(root: string, path: string): Promise<LineCounts> {
+    if (counting >= COUNT_CONCURRENCY) {
+        await new Promise<void>((ready) => countWaiters.push(ready));
+    } else {
+        counting++;
+    }
+
+    try {
+        const output = await git(
+            root,
+            ["diff", "--no-index", "--numstat", "-z", ...COUNT_FLAGS, "--", devNull, path],
+            { allowExit: [1], maxBuffer: 16_384 },
+        );
+
+        // Empty files produce no diff; binary files produce a record without line counts.
+        return parseNumstat(output).values().next().value ?? { added: 0, removed: 0 };
+    } finally {
+        const next = countWaiters.shift();
+
+        if (next) {
+            next();
+        } else {
+            counting--;
+        }
+    }
+}
+
+/** Missing/racing files must not break the entire review, nor cache a failed comparison. */
+function newFileCounts(
+    root: string,
+    path: string,
+    version: string | undefined,
+): Promise<LineCounts> {
+    if (version === undefined) {
+        return Promise.resolve({});
+    }
+
+    const key = JSON.stringify([root, path, version]);
+    const known = newCounts.get(key);
+
+    if (known && known.until > Date.now()) {
+        return known.value;
+    }
+
+    const value = countNewFile(root, path).catch(() => {
+        if (newCounts.get(key)?.value === value) {
+            newCounts.delete(key);
+        }
+
+        return {};
+    });
+
+    newCounts.delete(key);
+
+    if (newCounts.size >= MAX_NEW_COUNTS) {
+        newCounts.delete(newCounts.keys().next().value!);
+    }
+
+    newCounts.set(key, { until: Date.now() + NEW_COUNTS_TTL, value });
+
+    return value;
 }
 
 /** Where a folder is in its repository, as git writes paths: `app/` for the folder app, empty at the top. */
@@ -287,10 +369,18 @@ export async function changesIn(
     const status = changed.slice(0, MAX_FILES);
     // Without a first commit there is nothing to compare with: every file is new.
     const counts =
-        branch === undefined
-            ? new Map()
-            : parseNumstat(await git(root, ["diff", "HEAD", "--numstat", "-z", ...DIFF_FLAGS]));
+        head === undefined
+            ? new Map<string, LineCounts>()
+            : parseNumstat(await git(root, ["diff", "HEAD", "--numstat", "-z", ...COUNT_FLAGS]));
     const versions = await Promise.all(status.map(({ path }) => versionOf(join(root, path))));
+
+    await Promise.all(
+        status.map(async ({ code, path }, index) => {
+            if (code === "??" || head === undefined) {
+                counts.set(path, await newFileCounts(root, path, versions[index]));
+            }
+        }),
+    );
     const files = status.map(({ code, path }, index): ChangedFile => {
         const version = versions[index];
 

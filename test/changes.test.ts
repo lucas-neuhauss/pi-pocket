@@ -179,8 +179,8 @@ test("a session's changes list git's uncommitted files, mark Pi's, and give each
             {
                 path: "notes/todo.md",
                 kind: "new",
-                added: undefined,
-                removed: undefined,
+                added: 1,
+                removed: 0,
                 byPi: true,
             },
         ],
@@ -205,7 +205,7 @@ test("a session's changes list git's uncommitted files, mark Pi's, and give each
 
     await assert.rejects(app.workspace.changes(id, viewer), { status: 403 });
 
-    // A new file has no line counts to change, so its version is what says it did.
+    // A same-line-count rewrite still changes its version.
     const versionOf = async (path: string) =>
         (await app.workspace.changes(id, owner(app))).files.find((file) => file.path === path)
             ?.version;
